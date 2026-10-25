@@ -5,22 +5,44 @@
   "apiVersion": 7,
   "entry": "plugin.js",
   "description": "Anime en español latino (y subtitulado si no hay) desde animeav1.com, con inicio, géneros y descubrir. Prueba Voe, UPNShare, MP4Upload, YourUpload y StreamTape y te deja elegir entre los que funcionan.",
-  "author": "",
+  "author": "Jostin Santos",
   "icon": "icon.png",
   "color": "#8E6BFF",
-  "theme": { "accent": "#8E6BFF" },
-  "section": { "label": "AnimeAV1" },
-  "categories": ["anime"],
-  "capabilities": ["home", "discover", "search", "meta", "streams"],
-  "languages": ["Latino", "Subtitulado"],
-  "episodesPagination": { "enabled": true, "perPage": 50 },
+  "theme": {
+    "accent": "#8E6BFF"
+  },
+  "section": {
+    "label": "AnimeAV1"
+  },
+  "categories": [
+    "anime"
+  ],
+  "capabilities": [
+    "home",
+    "discover",
+    "search",
+    "meta",
+    "streams"
+  ],
+  "languages": [
+    "Latino",
+    "Subtitulado"
+  ],
+  "episodesPagination": {
+    "enabled": true,
+    "perPage": 50
+  },
   "config": [
     {
       "key": "idioma",
       "label": "Idioma",
       "type": "select",
       "default": "Latino, o subtitulado si no hay",
-      "options": ["Solo latino", "Latino, o subtitulado si no hay", "Solo subtitulado"]
+      "options": [
+        "Solo latino",
+        "Latino, o subtitulado si no hay",
+        "Solo subtitulado"
+      ]
     },
     {
       "key": "servidor",
@@ -35,5 +57,6 @@
         "StreamTape (mp4)"
       ]
     }
-  ]
+  ],
+  "newsImageStyle": "poster"
 }
