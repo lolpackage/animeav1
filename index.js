@@ -1,138 +1,172 @@
+// AnimeAV1 para tu app — v2.0.0
+// Port del plugin Kino v1.6.1 al runtime CommonJS de la app (flutter_js / QuickJS).
+//
+// Qué cambió respecto a Kino (la lógica de datos y de servidores es la misma):
+//  - En vez de `export async function ...` + `kino.fetch`, el plugin usa `module.exports` y el
+//    `fetch` global que la app puentea a Dart (sigue redirects, devuelve status/headers/body texto).
+//  - La app llama: getHome(), getDiscoverFilters(f), getDiscover({page,...}), search(q),
+//    getMeta(id), getStreams(id, type, season, episode), getCatalogs(), getCatalog(id,{page}).
+//    El `id` de cada item es el slug de animeav1 ("one-piece"); el de cada episodio "slug/N".
+//  - getStreams devuelve TODOS los servidores que funcionan (la app deja cambiar de servidor en
+//    el reproductor), ordenados: idioma primero, luego el servidor preferido de Configurar.
+//  - La app guarda los <select> de Configurar con el TEXTO de la opción, no con un "value";
+//    por eso la configuración se interpreta por texto (ver cfgIdioma / cfgServidor).
+//  - Sin descargas con Range: el puente de la app lee el cuerpo completo en memoria, así que los
+//    enlaces mp4 se verifican con HEAD y StreamTape con un redirect manual (nunca se baja el video).
+//
+// Los datos salen de los endpoints `__data.json` de SvelteKit (el mismo payload con el que el sitio
+// hidrata sus páginas), no de HTML, así que un cambio de diseño no rompe el plugin.
 
-// AnimeAV1 — port para la app (contrato lol.json / CommonJS) — v1.7.1
-//
-// Cambios respecto a v1.7.0:
-//   - Home mucho más liviano (menos peticiones en paralelo → menos timeouts/429)
-//   - User-Agent + headers más realistas
-//   - Idioma más tolerante con los textos que guarda la app
-//   - Pequeño retry en 429
-//   - Verificación de backdrops limitada
-//
-// Contrato que usa la app (ver js_runtime.dart / content_service.dart):
-//   getHome()                    -> [{ id, title, type, imageStyle, catalogId, items }]
-//   getDiscoverFilters()         -> [{ id, label, options:[{id,label}] }]   (máx. 3)
-//   getDiscover({page, ...})     -> { items, hasMore }
-//   getCatalogs() / getCatalog(id, {page})
-//   search(query)                -> [items]
-//   getMeta(id)                  -> item con seasons[].episodes[]
-//   getStreams(id, type, season, episode) -> [servidores]
-//
-// El `id` de cada item es el slug del sitio (p. ej. "one-piece"); el id de episodio es
-// "<slug>/<n>". Así getMeta y getStreams solo necesitan el id que la app ya les pasa.
-//
-// Voe va primero: MP4Upload sirve AV1 10-bit (sin decoder en muchas TV); Voe da H.264 720p HLS.
-const ADDON_ID = "animeav1";
 const BASE = "https://animeav1.com";
 const CDN = "https://cdn.animeav1.com";
+const ADDON_ID = "animeav1";
+const PROVIDER = "AnimeAV1";
 const BROWSER_UA =
-  "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
-const SEARCH_PAGES = 2;
-const PAGE_LIMIT = 60;
-const ROW_LIMIT = 24;
+  "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+
+const SEARCH_PAGES = 3; // páginas de resultados que se piden por búsqueda
+const HOME_ROW_LIMIT = 30; // items por fila del inicio (el inicio se cachea 24 h en la app)
+const PAGE_LIMIT = 60; // items máximos por página en Descubrir / Categorías
+const REQUEST_MS = 15000; // tope por petición
+const SERVER_MS = 18000; // tope por servidor al resolver video
+const MEMO_MS = 10 * 60 * 1000; // caché en memoria de páginas de catálogo
+
 // ---------------------------------------------------------------------------------------------
 // Utilidades
-function mkErr(code, msg) {
-  const e = new Error(msg);
-  e.code = code;
-  return e;
-}
-function log() {
-  try {
-    console.log.apply(console, ["animeav1:"].concat(Array.prototype.slice.call(arguments)));
-  } catch (_) {}
-}
-function cfg(key) {
-  const g = globalThis.__nuvioConfig || {};
-  const c = g[ADDON_ID] || g.current || {};
-  const v = c[key];
-  return v == null ? "" : String(v);
-}
-function kfetch(url, opts) {
-  opts = opts || {};
-  const ms = opts.timeoutMs;
-  const headers = Object.assign(
-    {
-      "User-Agent": BROWSER_UA,
-      Accept: "application/json, text/plain, */*",
-      "Accept-Language": "es-419,es;q=0.9,en;q=0.8",
-      Referer: BASE + "/",
-    },
-    opts.headers || {}
-  );
-  const o = Object.assign({}, opts, { headers: headers });
-  delete o.timeoutMs;
-  const p = fetch(url, o);
-  if (!ms) return p;
+
+function withTimeout(promise, ms, label) {
   return new Promise(function (resolve, reject) {
+    let done = false;
     const t = setTimeout(function () {
-      reject(new Error("timeout " + ms + "ms"));
+      if (!done) {
+        done = true;
+        reject(new Error((label || "operación") + ": tiempo agotado (" + ms + " ms)"));
+      }
     }, ms);
-    p.then(
+    promise.then(
       function (v) {
-        clearTimeout(t);
-        resolve(v);
+        if (!done) {
+          done = true;
+          clearTimeout(t);
+          resolve(v);
+        }
       },
       function (e) {
-        clearTimeout(t);
-        reject(e);
+        if (!done) {
+          done = true;
+          clearTimeout(t);
+          reject(e);
+        }
       }
     );
   });
 }
-function resolveUrl(base, rel) {
-  rel = String(rel);
-  if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(rel)) return rel;
-  const m = String(base).match(/^([a-zA-Z][a-zA-Z0-9+.\-]*:)\/\/([^\/?#]*)([^?#]*)/);
-  if (!m) return rel;
-  if (rel.indexOf("//") === 0) return m[1] + rel;
-  const origin = m[1] + "//" + m[2];
-  if (rel.charAt(0) === "/") return origin + rel;
-  const dir = m[3].replace(/[^\/]*$/, "");
-  const segs = (dir + rel).split("/");
-  const out = [];
-  for (let i = 0; i < segs.length; i++) {
-    if (segs[i] === "..") out.pop();
-    else if (segs[i] !== ".") out.push(segs[i]);
-  }
-  return origin + out.join("/");
+
+function http(url, opts, ms) {
+  return withTimeout(fetch(url, opts || {}), ms || REQUEST_MS, "fetch");
 }
+
+const memoStore = {};
+function memo(key, ttl, fn) {
+  const hit = memoStore[key];
+  if (hit && Date.now() - hit.t < ttl) return hit.p;
+  const p = Promise.resolve().then(fn);
+  memoStore[key] = { t: Date.now(), p: p };
+  p.catch(function () {
+    if (memoStore[key] && memoStore[key].p === p) delete memoStore[key];
+  });
+  return p;
+}
+
 function dedupe(items) {
-  const seen = new Set();
+  const seen = {};
   return items.filter(function (it) {
-    if (seen.has(it.id)) return false;
-    seen.add(it.id);
+    if (seen[it.id]) return false;
+    seen[it.id] = true;
     return true;
   });
 }
-// Pequeño retry solo para 429
-async function kfetchRetry(url, opts, retries) {
-  retries = retries == null ? 1 : retries;
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const r = await kfetch(url, opts);
-      if (r.status === 429 && i < retries) {
-        await new Promise(function (res) {
-          setTimeout(res, 900 + i * 400);
-        });
-        continue;
-      }
-      return r;
-    } catch (e) {
-      lastErr = e;
-      if (i < retries) {
-        await new Promise(function (res) {
-          setTimeout(res, 700);
-        });
-        continue;
-      }
-      throw e;
-    }
+
+function resolveUrl(base, rel) {
+  try {
+    return new URL(rel, base).href;
+  } catch (_) {
+    return rel;
   }
-  throw lastErr;
 }
+
+function decodeEscapes(s) {
+  return String(s)
+    .replace(/\\u([0-9a-fA-F]{4})/g, function (_, h) {
+      return String.fromCharCode(parseInt(h, 16));
+    })
+    .replace(/\\\//g, "/");
+}
+
+function decodeHtml(s) {
+  return String(s)
+    .replace(/&amp;/g, "&")
+    .replace(/&#x2F;/gi, "/")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"');
+}
+
 // ---------------------------------------------------------------------------------------------
-// Datos de SvelteKit (__data.json)
+// Configuración (Configurar → Idioma / Servidor preferido)
+// La app guarda el texto de la opción elegida; también se aceptan los valores internos.
+
+function cfg(key) {
+  try {
+    const all = globalThis.__nuvioConfig;
+    const mine = all && all[ADDON_ID];
+    const v = mine && mine[key];
+    return v == null ? "" : String(v).trim().toLowerCase();
+  } catch (_) {
+    return "";
+  }
+}
+
+function cfgIdioma() {
+  const v = cfg("idioma");
+  if (v === "dub" || v.indexOf("solo latino") === 0) return "dub";
+  if (v === "sub" || v.indexOf("solo sub") === 0) return "sub";
+  return "dub-sub"; // por defecto: latino, o subtitulado si no hay
+}
+
+function languagesToTry() {
+  const m = cfgIdioma();
+  if (m === "sub") return ["SUB"];
+  if (m === "dub") return ["DUB"];
+  return ["DUB", "SUB"];
+}
+
+const DEFAULT_ORDER = ["Voe", "UPNShare", "MP4Upload", "YourUpload", "StreamTape"];
+
+function cfgServidor() {
+  const v = cfg("servidor");
+  if (v.indexOf("upnshare") >= 0) return "UPNShare";
+  if (v.indexOf("mp4upload") >= 0) return "MP4Upload";
+  if (v.indexOf("yourupload") >= 0) return "YourUpload";
+  if (v.indexOf("streamtape") >= 0) return "StreamTape";
+  if (v.indexOf("voe") >= 0) return "Voe";
+  return "Voe";
+}
+
+// Voe primero (H.264 720p reproduce en cualquier TV), luego UPNShare (H.264 hasta 1080p) y al final
+// los mp4 planos (AV1, se traban en muchas TV). Lo elegido en Configurar va primero.
+function serverOrder() {
+  const first = cfgServidor();
+  return [first].concat(
+    DEFAULT_ORDER.filter(function (s) {
+      return s !== first;
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Datos de SvelteKit
+
+// Reconstruye el arreglo "aplanado" (devalue) que traen los nodos de `__data.json`.
 function unflatten(flat) {
   const cache = new Map();
   function get(i) {
@@ -140,19 +174,21 @@ function unflatten(flat) {
     if (cache.has(i)) return cache.get(i);
     const v = flat[i];
     if (Array.isArray(v)) {
+      // Un valor tipado (["Date", "..."], ["Map", ...]) empieza con una etiqueta de texto.
       if (typeof v[0] === "string") {
         cache.set(i, v[1]);
         return v[1];
       }
       const out = [];
       cache.set(i, out);
-      for (const x of v) out.push(get(x));
+      for (let k = 0; k < v.length; k++) out.push(get(v[k]));
       return out;
     }
     if (v && typeof v === "object") {
       const out = {};
       cache.set(i, out);
-      for (const k of Object.keys(v)) out[k] = get(v[k]);
+      const keys = Object.keys(v);
+      for (let k = 0; k < keys.length; k++) out[keys[k]] = get(v[keys[k]]);
       return out;
     }
     cache.set(i, v);
@@ -160,62 +196,61 @@ function unflatten(flat) {
   }
   return get(0);
 }
-function lastNodeData(body) {
+
+function lastDataNode(body) {
   const nodes = (body.nodes || []).filter(function (n) {
     return n && n.type === "data" && Array.isArray(n.data);
   });
   return nodes.length ? unflatten(nodes[nodes.length - 1].data) : null;
 }
+
 async function loadData(path, what) {
-  const r = await kfetchRetry(BASE + path + "/__data.json", {
-    headers: { Accept: "application/json" },
-    timeoutMs: 12000,
-  });
-  if (r.status === 404) throw mkErr("not_found", what + ": " + path);
-  if (r.status === 429) throw mkErr("rate_limited", what + ": HTTP 429");
-  if (!r.ok) throw mkErr("unavailable", what + ": HTTP " + r.status);
+  const r = await http(BASE + path + "/__data.json", { headers: { Accept: "application/json" } });
+  if (r.status === 404) throw new Error(what + ": no encontrado (" + path + ")");
+  if (r.status === 429) throw new Error(what + ": demasiadas peticiones (HTTP 429)");
+  if (!r.ok) throw new Error(what + ": HTTP " + r.status);
   const body = await r.json();
   if (body.type === "redirect" || body.type === "error") {
-    throw mkErr("not_found", what + ": " + body.type + " " + path);
+    throw new Error(what + ": " + body.type + " " + path);
   }
-  const data = lastNodeData(body);
-  if (!data) throw mkErr("unavailable", what + ": empty __data.json");
+  // El nodo de la página es el último con datos; los anteriores son layouts (menús, sesión).
+  const data = lastDataNode(body);
+  if (!data) throw new Error(what + ": __data.json vacío");
   return data;
 }
+
 // ---------------------------------------------------------------------------------------------
 // Items
+
 function isMovie(media) {
   const c = media.category || {};
   return c.slug === "pelicula" || c.malId === "Movie";
 }
-function toItem(media) {
-  const numId = String(media.id);
-  const movie = isMovie(media);
+
+function toItem(media, full) {
+  const id = String(media.id);
   const item = {
-    id: String(media.slug),
-    title: media.title,
-    type: movie ? "movie" : "series",
-    poster: CDN + "/covers/" + numId + ".jpg",
-    backdrop: CDN + "/backdrops/" + numId + ".jpg",
+    id: String(media.slug), // la app usa este id para getMeta / getStreams / favoritos
+    title: String(media.title),
+    poster: CDN + "/covers/" + id + ".jpg",
+    backdrop: CDN + "/backdrops/" + id + ".jpg",
+    type: isMovie(media) ? "movie" : "series",
     genres: ["Anime"],
   };
-  if (media.synopsis) item.overview = String(media.synopsis).trim();
+  if (media.synopsis) {
+    const s = String(media.synopsis).trim();
+    item.overview = full ? s : s.slice(0, 400);
+  }
   const year = String(media.startDate || "").slice(0, 4);
   if (/^\d{4}$/.test(year)) item.year = year;
   return item;
 }
-function mediaFromEpisode(e) {
-  const m = e && e.media;
-  if (!m || m.id == null || !m.slug || !m.title) return null;
-  const it = toItem(m);
-  if (e.number != null) {
-    it.badges = ["EP " + e.number];
-    it.backdrop = CDN + "/screenshots/" + String(m.id) + "/" + e.number + ".jpg";
-  }
-  return it;
-}
+
 // ---------------------------------------------------------------------------------------------
-// Catálogo del sitio
+// Catálogo (filtros del sitio: page, order, status, genre, category, search)
+// Los VALORES aceptados de order/status/category no están documentados: se prueban varios y se
+// queda el primero que de verdad cambia los resultados. Una fila que falle no rompe las demás.
+
 const GENEROS = [
   ["accion", "Acción"],
   ["aventura", "Aventura"],
@@ -230,9 +265,11 @@ const GENEROS = [
   ["deportes", "Deportes"],
   ["slice-of-life", "Slice of life"],
 ];
+
 const ORDER_CANDIDATES = ["popular", "popularity", "views", "score", "rating"];
 const STATUS_CANDIDATES = ["emision", "en-emision", "airing", "1"];
 const MOVIE_CANDIDATES = ["pelicula", "peliculas", "movie"];
+
 async function loadCatalog(params, page) {
   const qs = Object.keys(params)
     .map(function (k) {
@@ -240,566 +277,495 @@ async function loadCatalog(params, page) {
     })
     .concat(page > 1 ? ["page=" + page] : [])
     .join("&");
-  const r = await kfetchRetry(BASE + "/catalogo/__data.json" + (qs ? "?" + qs : ""), {
+  const r = await http(BASE + "/catalogo/__data.json" + (qs ? "?" + qs : ""), {
     headers: { Accept: "application/json" },
-    timeoutMs: 12000,
   });
-  if (r.status === 429) throw mkErr("rate_limited", "catalog: HTTP 429");
-  if (!r.ok) throw mkErr("unavailable", "catalog: HTTP " + r.status);
-  const data = lastNodeData(await r.json()) || {};
+  if (r.status === 429) throw new Error("catálogo: demasiadas peticiones (HTTP 429)");
+  if (!r.ok) throw new Error("catálogo: HTTP " + r.status);
+  const body = await r.json();
+  const data = lastDataNode(body) || {};
   const raw = (data.results || []).filter(function (m) {
     return m && m.id != null && m.slug && m.title;
   });
   return {
     raw: raw,
-    items: raw.map(toItem),
+    items: raw.map(function (m) {
+      return toItem(m);
+    }),
     totalPages: (data.pagination && data.pagination.totalPages) || 1,
     orderKey: data.orderKey,
   };
 }
-let baselinePromise = null;
+
+// Ids de los primeros resultados del catálogo sin filtrar (referencia para detectar filtros que sí funcionan).
 function baseline() {
-  if (!baselinePromise) {
-    baselinePromise = loadCatalog({}, 1)
-      .then(function (b) {
-        return b.raw
-          .slice(0, 10)
-          .map(function (m) {
-            return m.id;
-          })
-          .join(",");
+  return memo("baseline", MEMO_MS, async function () {
+    const b = await loadCatalog({}, 1);
+    return b.raw
+      .slice(0, 10)
+      .map(function (m) {
+        return m.id;
       })
-      .catch(function (e) {
-        baselinePromise = null;
-        throw e;
-      });
-  }
-  return baselinePromise;
+      .join(",");
+  });
 }
+
+// Prueba cada candidato; devuelve el primero cuyos resultados difieren del catálogo sin filtrar.
 async function pickParams(candidates) {
   const base = await baseline();
-  for (const c of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
     try {
-      const res = await loadCatalog(c, 1);
+      const res = await loadCatalog(candidates[i], 1);
       const ids = res.raw
         .slice(0, 10)
         .map(function (m) {
           return m.id;
         })
         .join(",");
-      if (res.raw.length > 0 && (ids !== base || (res.orderKey && res.orderKey !== "default"))) return c;
-    } catch (e) {
-      log("probe failed", JSON.stringify(c), e && e.message);
-    }
+      if (res.raw.length > 0 && (ids !== base || (res.orderKey && res.orderKey !== "default"))) {
+        return candidates[i];
+      }
+    } catch (_) {}
   }
   return null;
 }
-const paramMemo = {};
-function paramsFor(ref) {
-  if (ref.indexOf("gen:") === 0) return Promise.resolve({ genre: ref.slice(4) });
-  let cands = null;
-  if (ref === "ord") cands = ORDER_CANDIDATES.map(function (o) {
-    return { order: o };
+
+const paramsCache = {};
+// ref: "ord" | "emi" | "peli" | "gen:<slug>"  (el resultado correcto se recuerda mientras la app viva)
+async function paramsFor(ref) {
+  if (ref.indexOf("gen:") === 0) return { genre: ref.slice(4) };
+  if (paramsCache[ref]) return paramsCache[ref];
+  let p = null;
+  if (ref === "ord") {
+    p = await pickParams(
+      ORDER_CANDIDATES.map(function (o) {
+        return { order: o };
+      })
+    );
+  } else if (ref === "emi") {
+    p = await pickParams(
+      STATUS_CANDIDATES.map(function (s) {
+        return { status: s };
+      })
+    );
+  } else if (ref === "peli") {
+    p = await pickParams(
+      MOVIE_CANDIDATES.map(function (c) {
+        return { category: c };
+      })
+    );
+  }
+  if (p) paramsCache[ref] = p;
+  return p;
+}
+
+function loadHome() {
+  return memo("home", MEMO_MS, function () {
+    return loadData("", "inicio");
   });
-  else if (ref === "emi") cands = STATUS_CANDIDATES.map(function (s) {
-    return { status: s };
+}
+
+async function latestEpisodeItems() {
+  const d = await loadHome();
+  return dedupe(
+    (d.latestEpisodes || []).map(function (e) {
+      const m = e && e.media;
+      if (!m || m.id == null || !m.slug || !m.title) return null;
+      const it = toItem(m);
+      if (e.number != null) {
+        it.badge = "EP " + e.number;
+        it.backdrop = CDN + "/screenshots/" + m.id + "/" + e.number + ".jpg";
+      }
+      return it;
+    }).filter(Boolean)
+  );
+}
+
+// Una página de una lista con nombre ("emi", "eps", "ord", "peli", "serie", "gen:<slug>").
+function catalogPage(ref, page) {
+  return memo("cat:" + ref + ":" + page, MEMO_MS, async function () {
+    if (ref === "eps") {
+      return { items: await latestEpisodeItems(), totalPages: 1 };
+    }
+    if (ref === "serie") {
+      const res = await loadCatalog({}, page);
+      return {
+        items: res.raw
+          .filter(function (m) {
+            return !isMovie(m);
+          })
+          .map(function (m) {
+            return toItem(m);
+          }),
+        totalPages: res.totalPages,
+      };
+    }
+    const p = await paramsFor(ref);
+    if (!p) {
+      // Sin filtro de "en emisión" en el sitio: lo que recibió episodio hace poco está en emisión.
+      if (ref === "emi") return { items: await latestEpisodeItems(), totalPages: 1 };
+      throw new Error("filtro no soportado: " + ref);
+    }
+    const res = await loadCatalog(p, page);
+    return { items: res.items, totalPages: res.totalPages };
   });
-  else if (ref === "peli") cands = MOVIE_CANDIDATES.map(function (c) {
-    return { category: c };
-  });
-  if (!cands) return Promise.resolve(null);
-  if (!paramMemo[ref]) {
-    paramMemo[ref] = pickParams(cands).then(
-      function (p) {
-        if (!p) delete paramMemo[ref];
-        return p;
+}
+
+// Conserva solo backdrops que existen y los pone primero (la app usa el primero como portada de
+// cada categoría y de cada banner). Si ninguno existe, el primero usa su póster.
+const backdropOk = {};
+function hasBackdrop(it) {
+  if (!it.backdrop) return Promise.resolve(false);
+  if (!backdropOk[it.backdrop]) {
+    backdropOk[it.backdrop] = http(it.backdrop, { method: "HEAD" }, 8000).then(
+      function (r) {
+        return !!r.ok;
       },
-      function (e) {
-        delete paramMemo[ref];
-        throw e;
+      function () {
+        return false;
       }
     );
   }
-  return paramMemo[ref];
+  return backdropOk[it.backdrop];
 }
-// ---------------------------------------------------------------------------------------------
-// Home / filas
-const CACHE_MS = 8 * 60 * 1000;
-let homeCache = null;
-async function loadHome() {
-  if (!homeCache || Date.now() - homeCache.t > CACHE_MS) {
-    homeCache = { t: Date.now(), data: await loadData("", "home") };
-  }
-  return homeCache.data;
-}
-async function latestEpisodeItems() {
-  const d = await loadHome();
-  return dedupe((d.latestEpisodes || []).map(mediaFromEpisode).filter(Boolean));
-}
-const rowCache = {};
-async function rowItems(ref) {
-  const hit = rowCache[ref];
-  if (hit && Date.now() - hit.t < CACHE_MS) return hit.items;
-  let items = [];
-  if (ref === "eps") {
-    items = await latestEpisodeItems();
-  } else if (ref === "serie") {
-    const res = await loadCatalog({}, 1);
-    items = res.raw
-      .filter(function (m) {
-        return !isMovie(m);
-      })
-      .map(toItem);
-  } else {
-    const p = await paramsFor(ref);
-    if (p) items = (await loadCatalog(p, 1)).items;
-    else if (ref === "emi") items = await latestEpisodeItems();
-  }
-  if (items.length) rowCache[ref] = { t: Date.now(), items: items };
-  return items;
-}
-const backdropOk = new Map();
-function hasBackdrop(url) {
-  if (!backdropOk.has(url)) {
-    backdropOk.set(
-      url,
-      kfetch(url, { method: "HEAD", timeoutMs: 4500 }).then(
-        function (r) {
-          return !!r.ok;
-        },
-        function () {
-          return false;
-        }
-      )
-    );
-  }
-  return backdropOk.get(url);
-}
-async function verifyBackdrops(items, n) {
+
+async function withVerifiedBackdrops(items, n) {
   const head = items.slice(0, n);
-  const checks = await Promise.all(
-    head.map(function (it) {
-      return it.backdrop ? hasBackdrop(it.backdrop) : false;
-    })
-  );
+  const checks = await Promise.all(head.map(hasBackdrop));
   const good = [];
   const rest = [];
   head.forEach(function (it, i) {
     if (checks[i]) good.push(it);
     else {
-      const c = Object.assign({}, it);
-      c.backdrop = c.poster;
-      rest.push(c);
+      const copy = Object.assign({}, it);
+      delete copy.backdrop;
+      rest.push(copy);
     }
   });
-  return { good: good, rest: rest.concat(items.slice(n)) };
-}
-const ROW_DEFS = [
-  ["eps", "Últimos episodios", "backdrop"],
-  ["emi", "En emisión", "poster"],
-  ["ord", "Populares", "poster"],
-  ["peli", "Películas", "poster"],
-  ["serie", "Series", "poster"],
-];
-// Solo algunos géneros al inicio para no saturar
-const GENRES_HOME = GENEROS.slice(0, 6);
-let genreTilesPromise = null;
-function genreTiles() {
-  if (!genreTilesPromise) {
-    genreTilesPromise = Promise.all(
-      GENRES_HOME.map(function (g) {
-        return loadCatalog({ genre: g[0] }, 1).then(
-          function (r) {
-            return {
-              id: "gen:" + g[0],
-              title: g[1],
-              type: "catalog",
-              poster: r.items[0] && r.items[0].poster,
-            };
-          },
-          function () {
-            return { id: "gen:" + g[0], title: g[1], type: "catalog" };
-          }
-        );
-      })
-    ).catch(function (e) {
-      genreTilesPromise = null;
-      throw e;
-    });
-  }
-  return genreTilesPromise;
-}
-async function getHome() {
-  const lists = await Promise.all(
-    ROW_DEFS.map(function (d) {
-      return rowItems(d[0]).catch(function (e) {
-        log("row", d[0], "failed:", e && e.message);
-        return [];
-      });
-    })
-  );
-  const rows = [];
-  const epsItems = lists[0].length ? lists[0] : lists[2].length ? lists[2] : lists[1];
-  if (epsItems.length) {
-    const v = await verifyBackdrops(epsItems.slice(0, 6), 4);
-    const heroItems = (v.good.length ? v.good : v.rest).slice(0, 5);
-    rows.push({
-      id: "hero",
-      title: "Destacados",
-      type: "hero",
-      imageStyle: "backdrop",
-      items: heroItems,
-    });
-  }
-  for (let i = 0; i < ROW_DEFS.length; i++) {
-    const def = ROW_DEFS[i];
-    let items = lists[i];
-    if (!items.length) continue;
-    items = items.slice(0, ROW_LIMIT);
-    if (def[2] === "backdrop") {
-      const v = await verifyBackdrops(items, 6);
-      items = v.good.concat(v.rest);
-    }
-    rows.push({
-      id: def[0],
-      title: def[1],
-      type: "row",
-      imageStyle: def[2],
-      catalogId: def[0],
-      items: items,
-    });
-  }
-  const specials = [
-    ["emi", "En emisión"],
-    ["ord", "Populares"],
-    ["peli", "Películas"],
-    ["serie", "Series"],
-  ];
-  const listTiles = specials
-    .map(function (sp) {
-      const hit = rowCache[sp[0]];
-      const first = hit && hit.items[0];
-      return first
-        ? { id: sp[0], title: sp[1], type: "catalog", poster: first.poster, backdrop: first.poster }
-        : null;
-    })
-    .filter(Boolean);
-  if (listTiles.length) {
-    rows.push({
-      id: "catalogs",
-      title: "Catálogos",
-      type: "catalog",
-      imageStyle: "poster",
-      items: listTiles,
-    });
-  }
-  try {
-    rows.push({
-      id: "generos",
-      title: "Géneros",
-      type: "catalog",
-      imageStyle: "poster",
-      items: await genreTiles(),
-    });
-  } catch (e) {
-    log("genres failed:", e && e.message);
-  }
-  if (!rows.length) throw mkErr("unavailable", "home: no rows could be built");
-  return rows;
-}
-async function getNews() {
-  const items = await rowItems("eps").catch(function () {
-    return [];
-  });
-  return items.slice(0, 10).map(function (it) {
-    return {
-      id: it.id,
-      title: it.title,
-      poster: it.poster,
-      backdrop: it.backdrop,
-      message: it.badges && it.badges[0] ? "Episodio " + it.badges[0].replace(/^EP\s*/, "") : "Nuevo",
-    };
-  });
-}
-// ---------------------------------------------------------------------------------------------
-// Catálogos
-async function getCatalogs() {
-  const out = [];
-  const specials = [
-    ["emi", "En emisión"],
-    ["ord", "Populares"],
-    ["peli", "Películas"],
-    ["serie", "Series"],
-  ];
-  for (const s of specials) {
-    const hit = rowCache[s[0]];
-    const it = hit && hit.items[0];
-    out.push({ id: s[0], title: s[1], poster: it && it.poster, backdrop: it && it.poster });
-  }
-  // Todos los géneros aquí (pantalla de catálogos)
-  for (const g of GENEROS) {
-    out.push({ id: "gen:" + g[0], title: g[1] });
+  const out = good.concat(rest, items.slice(n));
+  if (good.length === 0 && out.length > 0 && out[0].poster) {
+    out[0] = Object.assign({}, out[0], { backdrop: out[0].poster });
   }
   return out;
 }
-async function browseRef(ref, page) {
-  ref = String(ref);
-  if (ref === "eps") {
+
+// ---------------------------------------------------------------------------------------------
+// Inicio y categorías
+
+const CATALOG_DEFS = [
+  ["emi", "En emisión"],
+  ["ord", "Populares"],
+  ["peli", "Películas"],
+  ["serie", "Series"],
+  ["eps", "Últimos episodios"],
+].concat(
+  GENEROS.map(function (g) {
+    return ["gen:" + g[0], g[1]];
+  })
+);
+
+async function catalogTile(def) {
+  try {
+    const res = await catalogPage(def[0], 1);
+    if (!res.items.length) return null;
+    const items = await withVerifiedBackdrops(res.items, 4);
+    const first = items[0];
     return {
-      items: (await latestEpisodeItems()).slice(0, PAGE_LIMIT),
-      hasMore: false,
-      page: 1,
-      totalPages: 1,
+      id: def[0],
+      title: def[1],
+      type: "catalog",
+      poster: first.poster,
+      backdrop: first.backdrop || first.poster,
     };
+  } catch (_) {
+    return null;
   }
-  let res;
-  let items;
-  if (ref === "serie") {
-    res = await loadCatalog({}, page);
-    items = res.raw
-      .filter(function (m) {
-        return !isMovie(m);
-      })
-      .map(toItem);
-  } else {
-    const p = await paramsFor(ref);
-    if (!p) {
-      if (ref === "emi" && page === 1) {
-        return {
-          items: (await latestEpisodeItems()).slice(0, PAGE_LIMIT),
-          hasMore: false,
-          page: 1,
-          totalPages: 1,
-        };
-      }
-      throw mkErr("unavailable", "browse: filter not supported " + ref);
-    }
-    res = await loadCatalog(p, page);
-    items = res.items;
-  }
+}
+
+function catalogTiles(defs) {
+  const key = "tiles:" + defs.map(function (d) { return d[0]; }).join(",");
+  return memo(key, MEMO_MS, async function () {
+    const tiles = await Promise.all(defs.map(catalogTile));
+    return tiles.filter(Boolean);
+  });
+}
+
+async function buildRow(def) {
+  // def: [id, título, ref, estilo de imagen]
+  let items = [];
+  try {
+    items = (await catalogPage(def[2], 1)).items;
+  } catch (_) {}
+  if (!items.length) return null;
   return {
-    items: dedupe(items).slice(0, PAGE_LIMIT),
-    hasMore: page < res.totalPages,
-    page: page,
-    totalPages: res.totalPages,
+    id: def[0],
+    title: def[1],
+    type: "row",
+    imageStyle: def[3],
+    items: items.slice(0, HOME_ROW_LIMIT),
   };
 }
+
+async function getHome() {
+  const defs = [
+    ["emi", "En emisión", "emi", "backdrop"],
+    ["eps", "Últimos episodios", "eps", "backdrop"],
+    ["ord", "Populares", "ord", "poster"],
+    ["peli", "Películas", "peli", "poster"],
+    ["serie", "Series", "serie", "poster"],
+  ];
+  const built = await Promise.all(defs.map(buildRow));
+  const rows = built.filter(Boolean);
+
+  if (rows.length) {
+    // La primera fila es el banner grande: backdrops verificados primero.
+    try {
+      rows[0].items = (await withVerifiedBackdrops(rows[0].items, 8)).slice(0, 10);
+    } catch (_) {}
+    rows[0].type = "hero";
+  }
+
+  const tiles = await catalogTiles(
+    GENEROS.map(function (g) {
+      return ["gen:" + g[0], g[1]];
+    })
+  );
+  if (tiles.length) {
+    rows.push({ id: "categorias", title: "Categorías", type: "catalog", imageStyle: "backdrop", items: tiles });
+  }
+
+  if (rows.length === 0) throw new Error("inicio: no se pudo armar ninguna fila");
+  return { rows: rows };
+}
+
+async function getCatalogs() {
+  return { catalogs: await catalogTiles(CATALOG_DEFS) };
+}
+
 async function getCatalog(catalogId, opts) {
   const page = Math.max(1, parseInt(opts && opts.page, 10) || 1);
-  return browseRef(catalogId, page);
+  const res = await catalogPage(String(catalogId), page);
+  return {
+    items: dedupe(res.items).slice(0, PAGE_LIMIT),
+    hasMore: page < res.totalPages,
+    page: page,
+  };
 }
+
 // ---------------------------------------------------------------------------------------------
-// Descubrir + búsqueda
+// Descubrir (filtros: Género, Tipo, Orden)
+
+const TIPO_OPTIONS = [
+  { id: "all", label: "Todos" },
+  { id: "series", label: "Series" },
+  { id: "peliculas", label: "Películas" },
+];
+const ORDEN_OPTIONS = [
+  { id: "recientes", label: "Recientes" },
+  { id: "populares", label: "Populares" },
+  { id: "emision", label: "En emisión" },
+];
+
 async function getDiscoverFilters() {
   return [
     {
       id: "genero",
       label: "Género",
-      options: [{ id: "todos", label: "Todos" }].concat(
+      options: [{ id: "all", label: "Todos" }].concat(
         GENEROS.map(function (g) {
           return { id: g[0], label: g[1] };
         })
       ),
     },
-    {
-      id: "tipo",
-      label: "Tipo",
-      options: [
-        { id: "todos", label: "Todos" },
-        { id: "serie", label: "Series" },
-        { id: "pelicula", label: "Películas" },
-      ],
-    },
-    {
-      id: "lista",
-      label: "Orden",
-      options: [
-        { id: "todos", label: "Recientes" },
-        { id: "popular", label: "Populares" },
-        { id: "emision", label: "En emisión" },
-      ],
-    },
+    { id: "tipo", label: "Tipo", options: TIPO_OPTIONS },
+    { id: "orden", label: "Orden", options: ORDEN_OPTIONS },
   ];
 }
+
 async function getDiscover(opts) {
   opts = opts || {};
   const page = Math.max(1, parseInt(opts.page, 10) || 1);
-  const genero = String(opts.genero || opts.genre || "todos");
-  const tipo = String(opts.tipo || "todos");
-  const lista = String(opts.lista || "todos");
+  const genero = String(opts.genero || opts.genre || opts.filter || "all");
+  const tipo = String(opts.tipo || "all");
+  const orden = String(opts.orden || "recientes");
+
   const params = {};
-  if (genero !== "todos") params.genre = genero;
-  if (lista === "popular") Object.assign(params, (await paramsFor("ord")) || {});
-  if (lista === "emision") Object.assign(params, (await paramsFor("emi")) || {});
-  if (tipo === "pelicula") Object.assign(params, (await paramsFor("peli")) || {});
-  const res = await loadCatalog(params, page);
-  let items = res.items;
-  if (tipo === "serie")
-    items = items.filter(function (it) {
-      return it.type !== "movie";
+  if (genero && genero !== "all") params.genre = genero;
+  if (tipo === "peliculas") {
+    const p = await paramsFor("peli");
+    if (p) Object.assign(params, p);
+  }
+  if (orden === "populares") {
+    const p = await paramsFor("ord");
+    if (p) Object.assign(params, p);
+  } else if (orden === "emision") {
+    const p = await paramsFor("emi");
+    if (p) Object.assign(params, p);
+  }
+
+  // "Series" se filtra aquí (el sitio no tiene un valor fiable de categoría para series). Si una
+  // página queda vacía al filtrar, se sigue con la siguiente para no cortar el scroll infinito.
+  let cur = page;
+  let res = await loadCatalog(params, cur);
+  let items = res.raw;
+  if (tipo === "series") {
+    items = items.filter(function (m) {
+      return !isMovie(m);
     });
-  if (tipo === "pelicula")
-    items = items.filter(function (it) {
-      return it.type === "movie";
-    });
-  return {
-    items: dedupe(items).slice(0, PAGE_LIMIT),
-    hasMore: page < res.totalPages,
-    page: page,
-    totalPages: res.totalPages,
-  };
+    let guard = 0;
+    while (items.length === 0 && cur < res.totalPages && guard < 3) {
+      cur++;
+      guard++;
+      res = await loadCatalog(params, cur);
+      items = res.raw.filter(function (m) {
+        return !isMovie(m);
+      });
+    }
+  }
+  const list = dedupe(
+    items.map(function (m) {
+      return toItem(m);
+    })
+  ).slice(0, PAGE_LIMIT);
+  return { items: list, hasMore: cur < res.totalPages, page: page };
 }
-async function searchPage(enc, page) {
-  const r = await kfetchRetry(
-    BASE + "/catalogo/__data.json?search=" + enc + (page > 1 ? "&page=" + page : ""),
-    { headers: { Accept: "application/json" }, timeoutMs: 12000 }
-  );
-  if (r.status === 429) throw mkErr("rate_limited", "search: HTTP 429");
-  if (!r.ok) throw mkErr("unavailable", "search: HTTP " + r.status);
-  const data = lastNodeData(await r.json()) || {};
+
+// ---------------------------------------------------------------------------------------------
+// Búsqueda
+
+async function loadSearch(enc, page) {
+  const r = await http(BASE + "/catalogo/__data.json?search=" + enc + (page > 1 ? "&page=" + page : ""), {
+    headers: { Accept: "application/json" },
+  });
+  if (r.status === 429) throw new Error("búsqueda: demasiadas peticiones (HTTP 429)");
+  if (!r.ok) throw new Error("búsqueda: HTTP " + r.status);
+  const body = await r.json();
+  const data = lastDataNode(body) || {};
   return {
     items: (data.results || [])
       .filter(function (m) {
         return m && m.id != null && m.slug && m.title;
       })
-      .map(toItem),
+      .map(function (m) {
+        return toItem(m);
+      }),
     totalPages: (data.pagination && data.pagination.totalPages) || 1,
   };
 }
+
+async function searchOnce(q) {
+  const enc = encodeURIComponent(q).replace(/%20/g, "+");
+  const first = await loadSearch(enc, 1);
+  let items = first.items.slice();
+  const pages = Math.min(first.totalPages, SEARCH_PAGES);
+  const more = [];
+  for (let p = 2; p <= pages; p++) more.push(loadSearch(enc, p).then(function (x) { return x.items; }, function () { return []; }));
+  const extra = await Promise.all(more);
+  extra.forEach(function (list) {
+    items = items.concat(list);
+  });
+  return items;
+}
+
 async function search(query) {
   const q = String(query || "").trim();
   if (!q) return [];
-  const enc = encodeURIComponent(q).replace(/%20/g, "+");
-  const first = await searchPage(enc, 1);
-  const items = first.items.slice();
-  const pages = Math.min(first.totalPages, SEARCH_PAGES);
-  for (let p = 2; p <= pages; p++) {
-    try {
-      items.push.apply(items, (await searchPage(enc, p)).items);
-    } catch (_) {
-      break;
-    }
+  const tries = [q];
+  const plain = q.replace(/[:;,.!?¡¿"'()\[\]\-–—_\/\\]+/g, " ").replace(/\s+/g, " ").trim();
+  if (plain && plain !== q) tries.push(plain);
+  for (let i = 0; i < tries.length; i++) {
+    const items = await searchOnce(tries[i]);
+    if (items.length) return dedupe(items).slice(0, 100);
   }
-  return dedupe(items).slice(0, PAGE_LIMIT);
+  return [];
 }
+
 // ---------------------------------------------------------------------------------------------
-// Detalle + episodios
+// Detalle y episodios
+
+function genresOf(media) {
+  const g = media.genres;
+  if (Array.isArray(g) && g.length) {
+    const out = g
+      .map(function (x) {
+        if (typeof x === "string") return x;
+        return x && (x.name || x.title || x.slug) ? String(x.name || x.title || x.slug) : "";
+      })
+      .filter(Boolean);
+    if (out.length) return out;
+  }
+  return ["Anime"];
+}
+
 async function getMeta(id) {
   const slug = String(id).split("/")[0];
-  const data = await loadData("/media/" + slug, "meta");
+  const data = await loadData("/media/" + slug, "detalle");
   const media = data.media;
-  if (!media) throw mkErr("not_found", "meta: no media for " + slug);
-  const item = toItem(media);
-  item.id = slug;
-  const nums = Array.from(
-    new Set(
-      (media.episodes || []).map(function (e) {
-        return Number(e && e.number);
-      })
-    )
-  )
+  if (!media) throw new Error("detalle: sin datos para " + slug);
+
+  const item = toItem(media, true);
+  item.genres = genresOf(media);
+  const score = Number(media.score);
+  if (isFinite(score) && score > 0 && score <= 10) item.rating = score;
+
+  if (item.type === "movie") return item;
+
+  const mid = String(media.id);
+  const seen = {};
+  const nums = (media.episodes || [])
+    .map(function (e) {
+      return Number(e && e.number);
+    })
     .filter(function (n) {
-      return Number.isInteger(n) && n >= 1;
+      if (!isFinite(n) || Math.floor(n) !== n || n < 1 || seen[n]) return false;
+      seen[n] = true;
+      return true;
     })
     .sort(function (a, b) {
       return a - b;
     });
-  if (item.type === "series" || nums.length > 1) {
-    if (nums.length === 0) throw mkErr("not_found", "meta: no episodes for " + slug);
-    item.type = "series";
-    item.seasons = [
-      {
-        number: 1,
-        name: "Episodios",
-        episodes: nums.map(function (n) {
-          return {
-            number: n,
-            id: slug + "/" + n,
-            title: "Episodio " + n,
-            still: CDN + "/screenshots/" + String(media.id) + "/" + n + ".jpg",
-          };
-        }),
-      },
-    ];
-  }
+  if (nums.length === 0) throw new Error("detalle: " + slug + " no tiene episodios");
+
+  item.seasons = [
+    {
+      number: 1,
+      name: "Episodios",
+      episodes: nums.map(function (n) {
+        return {
+          number: n,
+          id: slug + "/" + n, // la app lo reenvía a getStreams al pasar al siguiente episodio
+          title: "Episodio " + n,
+          still: CDN + "/screenshots/" + mid + "/" + n + ".jpg",
+        };
+      }),
+    },
+  ];
   return item;
 }
+
 // ---------------------------------------------------------------------------------------------
-// Servidores
-function decodeEscapes(s) {
-  return String(s)
-    .replace(/\\u([0-9a-fA-F]{4})/g, function (_, h) {
-      return String.fromCharCode(parseInt(h, 16));
-    })
-    .replace(/\\\//g, "/");
-}
-function decodeHtml(s) {
-  return String(s)
-    .replace(/&amp;/g, "&")
-    .replace(/&#x2F;/gi, "/")
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, '"');
-}
-async function checkVideo(url, headers) {
-  const r = await kfetch(url, {
-    headers: Object.assign({ Range: "bytes=0-1" }, headers),
-    timeoutMs: 8000,
-  });
-  if (r.status !== 200 && r.status !== 206) throw new Error("HTTP " + r.status);
-  return r;
-}
-async function checkHls(url, headers) {
-  const get = async function (u, h) {
-    const r = await kfetch(u, { headers: h, timeoutMs: 8000 });
-    if (r.status !== 200 && r.status !== 206) throw new Error("HTTP " + r.status);
-    return r;
-  };
-  const linesOf = function (t) {
-    return String(t)
-      .split("\n")
-      .map(function (l) {
-        return l.trim();
-      })
-      .filter(Boolean);
-  };
-  let playlistUrl = url;
-  let text = await (await get(playlistUrl, headers)).text();
-  if (text.indexOf("#EXTM3U") === -1) throw new Error("not a playlist");
-  let lines = linesOf(text);
-  if (
-    lines.some(function (l) {
-      return l.indexOf("#EXT-X-STREAM-INF") === 0;
-    })
-  ) {
-    const variant = lines.find(function (l) {
-      return l.charAt(0) !== "#";
-    });
-    if (!variant) throw new Error("empty master playlist");
-    playlistUrl = resolveUrl(playlistUrl, variant);
-    text = await (await get(playlistUrl, headers)).text();
-    lines = linesOf(text);
-  }
-  const seg = lines.find(function (l) {
-    return l.charAt(0) !== "#";
-  });
-  if (!seg) throw new Error("no segments in playlist");
-  await get(resolveUrl(playlistUrl, seg), Object.assign({ Range: "bytes=0-1" }, headers));
-}
+// Servidores de video
+
+// MP4Upload: un mp4 progresivo (hoy AV1 10-bit 1080p) en hosts que solo contestan con el Referer del sitio.
 async function fromMp4Upload(embedUrl) {
-  const r = await kfetch(embedUrl, { headers: { "User-Agent": BROWSER_UA } });
+  const r = await http(embedUrl, { headers: { "User-Agent": BROWSER_UA } });
   if (!r.ok) throw new Error("mp4upload HTTP " + r.status);
   const html = await r.text();
   const m =
     html.match(/src\s*:\s*["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i) ||
     html.match(/["']?file["']?\s*:\s*["'](https?:\/\/[^"']+)["']/i) ||
     html.match(/<source[^>]+src\s*=\s*["'](https?:\/\/[^"']+)["']/i);
-  if (!m) throw new Error("mp4upload: no video in embed");
+  if (!m) throw new Error("mp4upload: no hay video en el embed");
   return {
     url: decodeEscapes(m[1]),
-    hls: false,
+    isHls: false,
+    quality: "1080p",
     headers: { Referer: "https://www.mp4upload.com/", "User-Agent": BROWSER_UA },
   };
 }
+
+// Voe esconde sus fuentes en un texto JSON: rot13, marcas basura, base64, desplazamiento de -3,
+// reverso y base64 otra vez.
 function voeDecode(packed) {
   let s = packed.replace(/[a-zA-Z]/g, function (c) {
     const base = c <= "Z" ? 65 : 97;
@@ -812,12 +778,14 @@ function voeDecode(packed) {
   for (let i = 0; i < s.length; i++) shifted += String.fromCharCode(s.charCodeAt(i) - 3);
   return JSON.parse(atob(shifted.split("").reverse().join("")));
 }
+
 function voeSourceFrom(html) {
   const packed = html.match(/<script type="application\/json">\s*\[\s*"([^"]+)"\s*\]\s*<\/script>/);
   if (packed) {
     const data = voeDecode(packed[1]);
     if (data && data.source) return data.source;
   }
+  // Páginas viejas de Voe.
   const hls = html.match(/["']hls["']\s*:\s*["']([^"']+)["']/);
   if (hls) {
     const v = hls[1];
@@ -825,44 +793,105 @@ function voeSourceFrom(html) {
   }
   return null;
 }
+
+// Voe: voe.sx contesta con una redirección JS a un dominio espejo que rota; el espejo tiene el
+// reproductor. El HLS vive en un CDN cuyo dominio también rota.
 async function fromVoe(embedUrl) {
   let url = embedUrl;
   for (let hop = 0; hop < 3; hop++) {
-    const r = await kfetch(url, { headers: { "User-Agent": BROWSER_UA } });
+    const r = await http(url, { headers: { "User-Agent": BROWSER_UA } });
     if (!r.ok) throw new Error("voe HTTP " + r.status);
     const html = await r.text();
     const source = voeSourceFrom(html);
-    if (source) return { url: source, hls: true, headers: { "User-Agent": BROWSER_UA } };
+    if (source) {
+      return { url: source, isHls: true, quality: "720p", headers: { "User-Agent": BROWSER_UA } };
+    }
     const next = html.match(/window\.location\.href\s*=\s*['"]([^'"]+)['"]/);
     if (!next) break;
     url = next[1];
   }
-  throw new Error("voe: no source in page");
+  throw new Error("voe: no hay fuente en la página");
 }
-async function fromYourUpload(embedUrl) {
-  const r = await kfetch(embedUrl, {
-    headers: { "User-Agent": BROWSER_UA, Referer: BASE + "/" },
+
+// Un enlace mp4 es bueno si el servidor contesta un HEAD sin error (405/501 = no soporta HEAD).
+async function checkVideo(url, headers) {
+  const r = await http(url, { method: "HEAD", headers: headers }, 8000);
+  if (r.status >= 400 && r.status !== 405 && r.status !== 501) throw new Error("HTTP " + r.status);
+  return r;
+}
+
+// Un HLS es bueno si carga la lista, y el primer segmento de la primera variante contesta.
+// Devuelve la mayor altura anunciada en la lista maestra (para etiquetar la calidad).
+async function checkHls(url, headers) {
+  const getText = async function (u) {
+    const r = await http(u, { headers: headers }, 8000);
+    if (r.status !== 200 && r.status !== 206) throw new Error("HTTP " + r.status);
+    return r.text();
+  };
+  const linesOf = function (t) {
+    return String(t)
+      .split("\n")
+      .map(function (l) {
+        return l.trim();
+      })
+      .filter(Boolean);
+  };
+  let playlistUrl = url;
+  let text = await getText(playlistUrl);
+  if (text.indexOf("#EXTM3U") === -1) throw new Error("no es una lista HLS");
+  let lines = linesOf(text);
+  let best = 0;
+  if (
+    lines.some(function (l) {
+      return l.indexOf("#EXT-X-STREAM-INF") === 0;
+    })
+  ) {
+    lines.forEach(function (l) {
+      const m = /RESOLUTION=\d+x(\d+)/.exec(l);
+      if (m) best = Math.max(best, parseInt(m[1], 10));
+    });
+    const variant = lines.find(function (l) {
+      return l.charAt(0) !== "#";
+    });
+    if (!variant) throw new Error("lista maestra vacía");
+    playlistUrl = resolveUrl(playlistUrl, variant);
+    text = await getText(playlistUrl);
+    lines = linesOf(text);
+  }
+  const seg = lines.find(function (l) {
+    return l.charAt(0) !== "#";
   });
+  if (!seg) throw new Error("la lista no tiene segmentos");
+  await checkVideo(resolveUrl(playlistUrl, seg), headers);
+  return best;
+}
+
+// YourUpload: el embed nombra el mp4 en su meta og:video, y el host del archivo contesta 500
+// si la petición no trae el Referer del propio YourUpload.
+async function fromYourUpload(embedUrl) {
+  const r = await http(embedUrl, { headers: { "User-Agent": BROWSER_UA, Referer: BASE + "/" } });
   if (!r.ok) throw new Error("yourupload HTTP " + r.status);
   const html = await r.text();
   const m =
     html.match(/<meta[^>]+og:video["'][^>]*content=["']([^"']+)["']/i) ||
     html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+og:video["']/i) ||
     html.match(/file\s*:\s*["'](https?:\/\/[^"']+)["']/i);
-  if (!m) throw new Error("yourupload: no video in embed");
+  if (!m) throw new Error("yourupload: no hay video en el embed");
   const url = decodeHtml(decodeEscapes(m[1]));
   const headers = { Referer: "https://www.yourupload.com/", "User-Agent": BROWSER_UA };
   await checkVideo(url, headers);
-  return { url: url, hls: false, headers: headers };
+  return { url: url, isHls: false, quality: null, headers: headers };
 }
+
+// StreamTape: el script de la página arma el enlace en dos pedazos
+//   el.innerHTML = '//streamtape.com/get_vide' + ('xcdo?id=...&token=...').substring(2).substring(1)
+// (en el HTML hay una copia señuelo con el token malo). get_video contesta con una redirección al
+// archivo real, firmado para la IP de quien pide; esa dirección final es la que recibe el reproductor.
 async function fromStreamTape(embedUrl) {
-  const r = await kfetch(embedUrl, {
-    headers: { "User-Agent": BROWSER_UA, Referer: BASE + "/" },
-  });
+  const r = await http(embedUrl, { headers: { "User-Agent": BROWSER_UA, Referer: BASE + "/" } });
   if (!r.ok) throw new Error("streamtape HTTP " + r.status);
   const html = await r.text();
-  const re =
-    /getElementById\(\s*['"](?:robotlink|ideoolink|norobotlink)['"]\s*\)\.innerHTML\s*=\s*['"]([^'"]*)['"]\s*\+\s*\(\s*['"]([^'"]*)['"]\s*\)((?:\s*\.substring\(\s*\d+\s*\))*)/g;
+  const re = /getElementById\(\s*['"](?:robotlink|ideoolink|norobotlink)['"]\s*\)\.innerHTML\s*=\s*['"]([^'"]*)['"]\s*\+\s*\(\s*['"]([^'"]*)['"]\s*\)((?:\s*\.substring\(\s*\d+\s*\))*)/g;
   const links = [];
   let m;
   while ((m = re.exec(html)) !== null) {
@@ -872,19 +901,28 @@ async function fromStreamTape(embedUrl) {
     const head = m[1];
     links.push((head.indexOf("//") === 0 ? "https:" : "") + head + tail);
   }
-  if (links.length === 0) throw new Error("streamtape: no link in embed");
+  if (links.length === 0) throw new Error("streamtape: no hay enlace en el embed");
   let lastErr;
-  for (const link of links.slice(0, 3)) {
+  const tries = links.slice(0, 3);
+  for (let i = 0; i < tries.length; i++) {
     try {
-      const v = await checkVideo(link, { "User-Agent": BROWSER_UA });
-      return { url: v.url || link, hls: false, headers: { "User-Agent": BROWSER_UA } };
+      // Redirect manual: la app lee el cuerpo completo, así que nunca se sigue hasta el archivo.
+      const g = await http(tries[i], { headers: { "User-Agent": BROWSER_UA }, redirect: "manual" }, 10000);
+      const loc = g.headers && g.headers.get("location");
+      if (g.status >= 300 && g.status < 400 && loc) {
+        const finalUrl = resolveUrl(tries[i], loc);
+        await checkVideo(finalUrl, { "User-Agent": BROWSER_UA });
+        return { url: finalUrl, isHls: false, quality: null, headers: { "User-Agent": BROWSER_UA } };
+      }
+      throw new Error("sin redirección (HTTP " + g.status + ")");
     } catch (e) {
       lastErr = e;
     }
   }
-  throw lastErr || new Error("streamtape: no working link");
+  throw lastErr || new Error("streamtape: ningún enlace sirve");
 }
-// --- AES-128-CBC en JS puro (UPNShare) -------------------------------------------------------
+
+// --- AES-128-CBC en JS puro (UPNShare contesta con el hex de un JSON cifrado con AES-CBC) ----------
 const AES_SBOX_HEX =
   "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b27509832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cfd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdbe0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9ee1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16";
 const AES_SBOX = new Uint8Array(256);
@@ -902,10 +940,10 @@ function aesMul(a, b) {
   }
   return p;
 }
-const AES_M9 = new Uint8Array(256),
-  AES_M11 = new Uint8Array(256),
-  AES_M13 = new Uint8Array(256),
-  AES_M14 = new Uint8Array(256);
+const AES_M9 = new Uint8Array(256);
+const AES_M11 = new Uint8Array(256);
+const AES_M13 = new Uint8Array(256);
+const AES_M14 = new Uint8Array(256);
 for (let i = 0; i < 256; i++) {
   AES_M9[i] = aesMul(i, 9);
   AES_M11[i] = aesMul(i, 11);
@@ -917,10 +955,10 @@ function aesExpandKey(key) {
   w.set(key);
   let rcon = 1;
   for (let i = 16; i < 176; i += 4) {
-    let t0 = w[i - 4],
-      t1 = w[i - 3],
-      t2 = w[i - 2],
-      t3 = w[i - 1];
+    let t0 = w[i - 4];
+    let t1 = w[i - 3];
+    let t2 = w[i - 2];
+    let t3 = w[i - 1];
     if (i % 16 === 0) {
       const x = t0;
       t0 = AES_SBOX[t1] ^ rcon;
@@ -941,15 +979,14 @@ function aesDecryptBlock(w, input, out) {
   const t = new Uint8Array(16);
   for (let i = 0; i < 16; i++) s[i] = input[i] ^ w[160 + i];
   for (let round = 9; round >= 0; round--) {
-    for (let c = 0; c < 4; c++)
-      for (let r = 0; r < 4; r++) t[((c + r) % 4) * 4 + r] = s[c * 4 + r];
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) t[((c + r) % 4) * 4 + r] = s[c * 4 + r];
     for (let i = 0; i < 16; i++) s[i] = AES_INV[t[i]] ^ w[round * 16 + i];
     if (round > 0) {
       for (let c = 0; c < 4; c++) {
-        const a0 = s[c * 4],
-          a1 = s[c * 4 + 1],
-          a2 = s[c * 4 + 2],
-          a3 = s[c * 4 + 3];
+        const a0 = s[c * 4];
+        const a1 = s[c * 4 + 1];
+        const a2 = s[c * 4 + 2];
+        const a3 = s[c * 4 + 3];
         s[c * 4] = AES_M14[a0] ^ AES_M11[a1] ^ AES_M13[a2] ^ AES_M9[a3];
         s[c * 4 + 1] = AES_M9[a0] ^ AES_M14[a1] ^ AES_M11[a2] ^ AES_M13[a3];
         s[c * 4 + 2] = AES_M13[a0] ^ AES_M9[a1] ^ AES_M14[a2] ^ AES_M11[a3];
@@ -959,18 +996,20 @@ function aesDecryptBlock(w, input, out) {
   }
   out.set(s);
 }
-function strBytes(str) {
-  const u = new Uint8Array(str.length);
-  for (let i = 0; i < str.length; i++) u[i] = str.charCodeAt(i) & 255;
-  return u;
-}
+// hex de entrada -> texto de salida; key e iv son textos de 16 caracteres.
 function aesCbcDecryptHex(hex, keyText, ivText) {
   const clean = String(hex).trim();
-  if (!/^[0-9a-fA-F]+$/.test(clean) || clean.length % 32 !== 0) throw new Error("not AES-CBC hex");
+  if (!/^[0-9a-fA-F]+$/.test(clean) || clean.length % 32 !== 0) throw new Error("no es AES-CBC en hex");
   const data = new Uint8Array(clean.length / 2);
   for (let i = 0; i < data.length; i++) data[i] = parseInt(clean.substr(i * 2, 2), 16);
-  const w = aesExpandKey(strBytes(keyText));
-  let prev = strBytes(ivText);
+  const keyBytes = new Uint8Array(16);
+  const ivBytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    keyBytes[i] = keyText.charCodeAt(i);
+    ivBytes[i] = ivText.charCodeAt(i);
+  }
+  const w = aesExpandKey(keyBytes);
+  let prev = ivBytes;
   const out = new Uint8Array(data.length);
   const block = new Uint8Array(16);
   for (let off = 0; off < data.length; off += 16) {
@@ -982,27 +1021,27 @@ function aesCbcDecryptHex(hex, keyText, ivText) {
   const end = pad >= 1 && pad <= 16 ? out.length - pad : out.length;
   return new TextDecoder().decode(out.subarray(0, end));
 }
+
+// UPNShare: /api/v1/video contesta con los ajustes del reproductor, cifrados con una llave fija
+// que usa el propio reproductor del sitio. Adentro: "cfNative" (la lista servida por el host del
+// reproductor) y "source" (la misma lista en una IP directa). Ambas piden el Referer del reproductor.
 const UPN_KEY = "kiemtienmua911ca";
 const UPN_IV = "1234567890oiuytr";
 async function fromUpnShare(embedUrl) {
   const id = (String(embedUrl).split("#")[1] || "").replace(/^\//, "");
   const om = String(embedUrl).match(/^https?:\/\/[^\/#?]+/);
-  if (!id || !om) throw new Error("upnshare: bad embed url");
+  if (!id || !om) throw new Error("upnshare: url de embed inválida");
   const origin = om[0];
   const headers = { Referer: origin + "/", "User-Agent": BROWSER_UA };
   const api =
-    origin +
-    "/api/v1/video?id=" +
-    encodeURIComponent(id) +
-    "&w=1920&h=1080&r=" +
-    encodeURIComponent(BASE + "/");
-  const r = await kfetch(api, { headers: headers });
+    origin + "/api/v1/video?id=" + encodeURIComponent(id) + "&w=1920&h=1080&r=" + encodeURIComponent(BASE + "/");
+  const r = await http(api, { headers: headers });
   if (!r.ok) throw new Error("upnshare api HTTP " + r.status);
   let info;
   try {
     info = JSON.parse(aesCbcDecryptHex(await r.text(), UPN_KEY, UPN_IV));
   } catch (e) {
-    throw new Error("upnshare: cannot read reply (" + (e && e.message) + ")");
+    throw new Error("upnshare: no se pudo leer la respuesta (" + (e && e.message) + ")");
   }
   const candidates = [info.cfNative, info.source]
     .filter(function (s) {
@@ -1011,19 +1050,19 @@ async function fromUpnShare(embedUrl) {
     .map(function (s) {
       return resolveUrl(origin + "/", s);
     });
-  if (candidates.length === 0) throw new Error("upnshare: no playlist in reply");
+  if (candidates.length === 0) throw new Error("upnshare: no hay lista en la respuesta");
   let lastErr;
-  for (const url of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
     try {
-      await checkHls(url, headers);
-      return { url: url, hls: true, headers: headers };
+      const height = await checkHls(candidates[i], headers);
+      return { url: candidates[i], isHls: true, quality: height ? height + "p" : null, headers: headers };
     } catch (e) {
       lastErr = e;
-      log("upnshare candidate failed:", e && e.message);
     }
   }
-  throw lastErr || new Error("upnshare: no playable link");
+  throw lastErr || new Error("upnshare: ningún enlace reproduce");
 }
+
 const RESOLVERS = {
   Voe: fromVoe,
   MP4Upload: fromMp4Upload,
@@ -1031,160 +1070,90 @@ const RESOLVERS = {
   StreamTape: fromStreamTape,
   UPNShare: fromUpnShare,
 };
-const QUALITY_HINT = {
-  Voe: "720p",
-  UPNShare: "1080p",
-  MP4Upload: "1080p AV1",
-  YourUpload: "MP4",
-  StreamTape: "MP4",
-};
-const LANG_LABEL = { DUB: "Latino", SUB: "Subtitulado" };
+
 // ---------------------------------------------------------------------------------------------
-// Preferencias
-function languageGroups() {
-  const v = cfg("idioma").toLowerCase();
-  if (v.indexOf("solo latino") >= 0 || v.indexOf("latino") >= 0 || v === "dub") return [["DUB"]];
-  if (v.indexOf("solo sub") >= 0 || v.indexOf("subtitul") >= 0 || v === "sub") return [["SUB"]];
-  // Por defecto: primero latino, luego sub
-  return [["DUB"], ["SUB"]];
+// getStreams(id, type, season, episode)
+// `id` puede ser "slug" (la app manda el id de la serie + el número de episodio) o "slug/N"
+// (al pasar al siguiente episodio la app manda el id del episodio).
+
+function loadEpisodePage(slug, number) {
+  return loadData("/media/" + slug + "/" + number, "episodio");
 }
-const DEFAULT_ORDER = ["Voe", "UPNShare", "MP4Upload", "YourUpload", "StreamTape"];
-function serverOrder() {
-  const v = cfg("servidor").toLowerCase();
-  let first = null;
-  for (let i = 0; i < DEFAULT_ORDER.length; i++) {
-    if (v.indexOf(DEFAULT_ORDER[i].toLowerCase()) === 0) first = DEFAULT_ORDER[i];
-  }
-  return first ? [first].concat(DEFAULT_ORDER.filter(function (s) {
-    return s !== first;
-  })) : DEFAULT_ORDER;
-}
-// ---------------------------------------------------------------------------------------------
-// Streams
-const RESOLVE_BUDGET_MS = 22000;
-const GRACE_MS = 3500;
-function resolveAll(jobs) {
-  return new Promise(function (resolve) {
-    const results = [];
-    const failures = [];
-    let pending = jobs.length;
-    let done = false;
-    let graceStarted = false;
-    function finish() {
-      if (done) return;
-      done = true;
-      resolve({ results: results.slice(), failures: failures.slice() });
-    }
-    if (pending === 0) return finish();
-    setTimeout(finish, RESOLVE_BUDGET_MS);
-    jobs.forEach(function (job) {
-      job()
-        .then(
-          function (r) {
-            results.push(r);
-            if (!graceStarted) {
-              graceStarted = true;
-              setTimeout(finish, GRACE_MS);
-            }
-          },
-          function (e) {
-            failures.push(e && e.message ? e.message : String(e));
-          }
-        )
-        .then(function () {
-          pending--;
-          if (pending === 0) finish();
-        });
-    });
-  });
-}
-async function embedsFor(slug, number) {
+
+async function getStreams(id, type, season, episode) {
+  const parts = String(id || "").split("/");
+  const slug = parts[0];
+  if (!slug) return [];
+  let number = parts[1] || (episode != null && episode !== "" ? String(episode) : "");
+
   let data;
-  try {
-    data = await loadData("/media/" + slug + "/" + number, "streams");
-  } catch (e) {
-    if (number !== "1") throw e;
-    const media = (await loadData("/media/" + slug, "streams")).media || {};
+  if (number) {
+    data = await loadEpisodePage(slug, number);
+  } else {
+    // Película (o llamada sin episodio): usar el primer episodio que liste el sitio.
+    const media = (await loadData("/media/" + slug, "episodio")).media || {};
     const nums = (media.episodes || [])
       .map(function (x) {
         return Number(x && x.number);
       })
       .filter(function (n) {
-        return n >= 0;
+        return isFinite(n) && n >= 0;
       });
-    if (nums.length === 0) throw e;
+    if (nums.length === 0) return [];
     number = String(Math.min.apply(null, nums));
-    data = await loadData("/media/" + slug + "/" + number, "streams");
+    data = await loadEpisodePage(slug, number);
   }
-  return { embeds: data.embeds || {}, number: number };
-}
-async function getStreams(id, type, season, episode) {
-  const parts = String(id).split("/");
-  const slug = parts[0];
-  const number = String(episode != null ? episode : parts[1] || "1");
-  const found = await embedsFor(slug, number);
-  const embeds = found.embeds;
+  const embeds = data.embeds || {};
   const order = serverOrder();
-  const groups = languageGroups();
-  const allFailures = [];
-  for (const group of groups) {
-    const jobs = [];
-    for (const lang of group) {
-      const list = (embeds[lang] || []).filter(function (e) {
+  const langs = languagesToTry();
+
+  for (let li = 0; li < langs.length; li++) {
+    const lang = langs[li];
+    const list = (embeds[lang] || [])
+      .filter(function (e) {
         return e && e.url && RESOLVERS[e.server];
-      });
-      list.sort(function (a, b) {
+      })
+      .sort(function (a, b) {
         return order.indexOf(a.server) - order.indexOf(b.server);
       });
-      for (const e of list) {
-        jobs.push(function () {
-          return RESOLVERS[e.server](e.url)
-            .then(function (r) {
-              return {
-                url: r.url,
-                name: e.server,
-                quality: QUALITY_HINT[e.server],
-                language: LANG_LABEL[lang] || lang,
-                provider: "AnimeAV1",
-                headers: r.headers || {},
-                isHls: !!r.hls,
-                _rank: order.indexOf(e.server),
-              };
-            })
-            .catch(function (err) {
-              log(lang, e.server, "failed:", err && err.message);
-              throw new Error(lang + "/" + e.server + ": " + (err && err.message));
-            });
-        });
-      }
-    }
-    const res = await resolveAll(jobs);
-    res.failures.forEach(function (f) {
-      allFailures.push(f);
-    });
-    if (res.results.length) {
-      res.results.sort(function (a, b) {
-        return a._rank - b._rank;
-      });
-      return res.results.map(function (r) {
-        delete r._rank;
-        return r;
-      });
-    }
-  }
-  const offered =
-    Object.keys(embeds)
-      .filter(function (k) {
-        return (embeds[k] || []).length;
+    if (list.length === 0) continue;
+
+    // Todos los servidores del idioma se resuelven a la vez; los que fallen se descartan.
+    const resolved = await Promise.all(
+      list.map(function (e) {
+        return withTimeout(
+          Promise.resolve().then(function () {
+            return RESOLVERS[e.server](e.url);
+          }),
+          SERVER_MS,
+          e.server
+        ).then(
+          function (s) {
+            return {
+              url: s.url,
+              name: e.server,
+              quality: s.quality || null,
+              language: lang === "DUB" ? "Latino" : "Subtitulado",
+              provider: PROVIDER,
+              headers: s.headers || {},
+              isHls: !!s.isHls,
+            };
+          },
+          function () {
+            return null;
+          }
+        );
       })
-      .join(", ") || "ninguno";
-  log("sin streams para", slug, number, "| ofrece:", offered, "|", allFailures.join("; "));
+    );
+    const streams = resolved.filter(Boolean);
+    // Latino, o subtitulado si no hay: se queda con el primer idioma que dé al menos un servidor.
+    if (streams.length) return streams;
+  }
   return [];
 }
-// ---------------------------------------------------------------------------------------------
+
 module.exports = {
   getHome: getHome,
-  getNews: getNews,
   getCatalogs: getCatalogs,
   getCatalog: getCatalog,
   getDiscoverFilters: getDiscoverFilters,
