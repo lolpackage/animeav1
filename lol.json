@@ -1,0 +1,89 @@
+{
+  "id": "animeav1",
+  "name": "AnimeAV1",
+  "version": "1.6.1",
+  "apiVersion": 6,
+  "description": "Anime en español latino (y subtitulado si no hay) desde animeav1.com",
+  "author": "Community",
+  "icon": "icon.png",
+  "homepage": "https://animeav1.com",
+  "entry": "index.js",
+  "browser": true,
+  "section": {
+    "label": "AnimeAV1"
+  },
+  "color": "#8E6BFF",
+  "theme": {
+    "accent": "#8E6BFF",
+    "onAccent": "#ffffff",
+    "background": "#0B0E14",
+    "surface": "#141A22",
+    "highlight": "#B794FF"
+  },
+  "newsImageStyle": "poster",
+  "capabilities": [
+    "home",
+    "search",
+    "discover",
+    "meta",
+    "streams",
+    "catalogs"
+  ],
+  "tabs": [
+    "home",
+    "discover",
+    "search",
+    "library",
+    "settings"
+  ],
+  "config": [
+    {
+      "key": "idioma",
+      "label": "Idioma",
+      "type": "select",
+      "default": "dub-sub",
+      "options": [
+        {
+          "value": "dub",
+          "label": "Solo latino"
+        },
+        {
+          "value": "dub-sub",
+          "label": "Latino, o subtitulado si no hay"
+        },
+        {
+          "value": "sub",
+          "label": "Solo subtitulado"
+        }
+      ]
+    },
+    {
+      "key": "servidor",
+      "label": "Servidor preferido",
+      "type": "select",
+      "default": "voe",
+      "options": [
+        {
+          "value": "voe",
+          "label": "Voe (720p, TV)"
+        },
+        {
+          "value": "upnshare",
+          "label": "UPNShare (1080p)"
+        },
+        {
+          "value": "mp4upload",
+          "label": "MP4Upload (AV1)"
+        },
+        {
+          "value": "yourupload",
+          "label": "YourUpload"
+        },
+        {
+          "value": "streamtape",
+          "label": "StreamTape"
+        }
+      ]
+    }
+  ]
+}
