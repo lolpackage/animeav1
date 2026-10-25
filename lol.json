@@ -1,21 +1,22 @@
 {
   "id": "animeav1",
   "name": "AnimeAV1",
-  "version": "1.7.0",
+  "version": "2.0.0",
   "apiVersion": 7,
+  "author": "",
+  "description": "Anime en español latino (y subtitulado si no hay) desde animeav1.com, con catálogo en Inicio, Descubrir y Categorías. Prueba Voe, UPNShare, MP4Upload, YourUpload y StreamTape y te deja cambiar de servidor en el reproductor.",
   "entry": "plugin.js",
-  "description": "Anime en español latino (y subtitulado si no hay) desde animeav1.com, con inicio, géneros y descubrir. Prueba Voe, UPNShare, MP4Upload, YourUpload y StreamTape y te deja elegir entre los que funcionan.",
-  "author": "Jostin Santos",
   "icon": "icon.png",
   "color": "#8E6BFF",
-  "theme": {
-    "accent": "#8E6BFF"
-  },
   "section": {
     "label": "AnimeAV1"
   },
   "categories": [
     "anime"
+  ],
+  "languages": [
+    "Latino",
+    "Subtitulado"
   ],
   "capabilities": [
     "home",
@@ -24,20 +25,13 @@
     "meta",
     "streams"
   ],
-  "languages": [
-    "Latino",
-    "Subtitulado"
-  ],
-  "episodesPagination": {
-    "enabled": true,
-    "perPage": 50
-  },
   "config": [
     {
       "key": "idioma",
       "label": "Idioma",
       "type": "select",
       "default": "Latino, o subtitulado si no hay",
+      "description": "Qué audio buscar al reproducir.",
       "options": [
         "Solo latino",
         "Latino, o subtitulado si no hay",
@@ -49,6 +43,7 @@
       "label": "Servidor preferido",
       "type": "select",
       "default": "Voe (720p, funciona en TV)",
+      "description": "El que se prueba primero; los demás quedan disponibles en el reproductor.",
       "options": [
         "Voe (720p, funciona en TV)",
         "UPNShare (hasta 1080p, funciona en TV)",
@@ -57,6 +52,5 @@
         "StreamTape (mp4)"
       ]
     }
-  ],
-  "newsImageStyle": "poster"
+  ]
 }
