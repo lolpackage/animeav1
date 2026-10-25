@@ -1,7 +1,7 @@
 {
   "id": "animeav1",
   "name": "AnimeAV1",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "apiVersion": 7,
   "author": "",
   "description": "Anime en español latino (y subtitulado si no hay) desde animeav1.com, con catálogo en Inicio, Descubrir y Categorías. Prueba Voe, UPNShare, MP4Upload, YourUpload y StreamTape y te deja cambiar de servidor en el reproductor.",
