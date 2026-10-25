@@ -427,14 +427,38 @@ async function getHome() {
     rows.push({ id: def[0], title: def[1], type: "row", imageStyle: def[2], catalogId: def[0], items: items });
   }
 
+  // Catálogos (como en el ejemplo de Cuevana): listas principales y géneros, con imagen.
+  const specials = [["emi", "En emisión"], ["ord", "Populares"], ["peli", "Películas"], ["serie", "Series"]];
+  const listTiles = specials
+    .map(function (sp) {
+      const hit = rowCache[sp[0]];
+      const first = hit && hit.items[0];
+      return first ? { id: sp[0], title: sp[1], type: "catalog", poster: first.poster, backdrop: first.poster } : null;
+    })
+    .filter(Boolean);
+  if (listTiles.length) rows.push({ id: "catalogs", title: "Catálogos", type: "catalog", imageStyle: "poster", items: listTiles });
   try {
-    rows.push({ id: "catalogs", title: "Géneros", type: "catalog", imageStyle: "poster", items: await genreTiles() });
+    rows.push({ id: "generos", title: "Géneros", type: "catalog", imageStyle: "poster", items: await genreTiles() });
   } catch (e) {
     log("genres failed:", e && e.message);
   }
 
   if (!rows.length) throw mkErr("unavailable", "home: no rows could be built");
   return rows;
+}
+
+// Novedades del launcher: los últimos episodios publicados.
+async function getNews() {
+  const items = await rowItems("eps").catch(function () { return []; });
+  return items.slice(0, 12).map(function (it) {
+    return {
+      id: it.id,
+      title: it.title,
+      poster: it.poster,
+      backdrop: it.backdrop,
+      message: it.badges && it.badges[0] ? "Episodio " + it.badges[0].replace(/^EP\s*/, "") : "Nuevo",
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1051,6 +1075,7 @@ async function getStreams(id, type, season, episode) {
 
 module.exports = {
   getHome: getHome,
+  getNews: getNews,
   getCatalogs: getCatalogs,
   getCatalog: getCatalog,
   getDiscoverFilters: getDiscoverFilters,
