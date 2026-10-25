@@ -1,88 +1,38 @@
 {
   "id": "animeav1",
   "name": "AnimeAV1",
-  "version": "1.6.1",
-  "apiVersion": 6,
-  "description": "Anime en español latino (y subtitulado si no hay) desde animeav1.com",
-  "author": "Community",
+  "version": "1.7.0",
+  "apiVersion": 7,
+  "entry": "plugin.js",
+  "description": "Anime en español latino (y subtitulado si no hay) desde animeav1.com, con inicio, géneros y descubrir. Prueba Voe, UPNShare, MP4Upload, YourUpload y StreamTape y te deja elegir entre los que funcionan.",
+  "author": "",
   "icon": "icon.png",
-  "homepage": "https://animeav1.com",
-  "entry": "index.js",
-  "browser": true,
-  "section": {
-    "label": "AnimeAV1"
-  },
   "color": "#8E6BFF",
-  "theme": {
-    "accent": "#8E6BFF",
-    "onAccent": "#ffffff",
-    "background": "#0B0E14",
-    "surface": "#141A22",
-    "highlight": "#B794FF"
-  },
-  "newsImageStyle": "poster",
-  "capabilities": [
-    "home",
-    "search",
-    "discover",
-    "meta",
-    "streams",
-    "catalogs"
-  ],
-  "tabs": [
-    "home",
-    "discover",
-    "search",
-    "library",
-    "settings"
-  ],
+  "theme": { "accent": "#8E6BFF" },
+  "section": { "label": "AnimeAV1" },
+  "categories": ["anime"],
+  "capabilities": ["home", "discover", "search", "meta", "streams"],
+  "languages": ["Latino", "Subtitulado"],
+  "episodesPagination": { "enabled": true, "perPage": 50 },
   "config": [
     {
       "key": "idioma",
       "label": "Idioma",
       "type": "select",
-      "default": "dub-sub",
-      "options": [
-        {
-          "value": "dub",
-          "label": "Solo latino"
-        },
-        {
-          "value": "dub-sub",
-          "label": "Latino, o subtitulado si no hay"
-        },
-        {
-          "value": "sub",
-          "label": "Solo subtitulado"
-        }
-      ]
+      "default": "Latino, o subtitulado si no hay",
+      "options": ["Solo latino", "Latino, o subtitulado si no hay", "Solo subtitulado"]
     },
     {
       "key": "servidor",
       "label": "Servidor preferido",
       "type": "select",
-      "default": "voe",
+      "default": "Voe (720p, funciona en TV)",
       "options": [
-        {
-          "value": "voe",
-          "label": "Voe (720p, TV)"
-        },
-        {
-          "value": "upnshare",
-          "label": "UPNShare (1080p)"
-        },
-        {
-          "value": "mp4upload",
-          "label": "MP4Upload (AV1)"
-        },
-        {
-          "value": "yourupload",
-          "label": "YourUpload"
-        },
-        {
-          "value": "streamtape",
-          "label": "StreamTape"
-        }
+        "Voe (720p, funciona en TV)",
+        "UPNShare (hasta 1080p, funciona en TV)",
+        "MP4Upload (1080p AV1, celular)",
+        "YourUpload (mp4)",
+        "StreamTape (mp4)"
       ]
     }
   ]
